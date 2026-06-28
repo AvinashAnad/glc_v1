@@ -1,71 +1,183 @@
-"""Adapter for laptop microphone (local voice-first channel)."""
+"""Laptop microphone adapter.
+
+The wire format is course-defined: inbound events carry WAV bytes from the
+recording loop, and outbound replies become synthesized audio sent to the
+speaker/playback surface.
+"""
 
 from __future__ import annotations
 
 import base64
 import hashlib
+import io
+import math
+import struct
+import wave
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 
 from glc.channels.base import ChannelAdapter
 from glc.channels.envelope import ChannelMessage, ChannelReply
+from glc.security.allowlists import allowed
+from glc.security.pairing import get_pairing_store
 from glc.security.trust_level import classify
-from glc.voice.stt import router as stt_router
-from glc.voice.tts import router as tts_router
+from glc.voice.stt import transcribe as transcribe_audio
+from glc.voice.tts import synthesize as synthesize_speech
 
-_WAV_HEADER_BYTES = 44
+DEFAULT_VAD_RMS_THRESHOLD = 200.0
 
 
 class Adapter(ChannelAdapter):
     name = "local_mic"
 
-    async def on_message(self, raw: Any) -> ChannelMessage | None:  # type: ignore[override]
+    async def on_message(self, raw: Any) -> ChannelMessage:
         mock = self.config.get("mock")
-
         if mock is not None and mock.pop_disconnect():
-            return None
+            return _drop()
 
-        wav_bytes: bytes = raw["wav_bytes"]
-        speaker_id: str = raw["speaker_id"]
-        speaker_handle: str = raw["speaker_handle"]
+        if not isinstance(raw, dict):
+            return _drop()
 
-        # VAD: skip 44-byte WAV header, check audio payload for silence
-        audio_payload = wav_bytes[_WAV_HEADER_BYTES:]
-        if audio_payload and all(b == 0 for b in audio_payload[:200]):
-            return None
+        wav_bytes = _as_bytes(raw.get("wav_bytes") or raw.get("audio_bytes") or b"")
+        if not wav_bytes:
+            return _drop()
 
-        trust_level = classify("local_mic", speaker_id)
+        speaker_id = str(raw.get("speaker_id") or raw.get("channel_user_id") or "local")
+        speaker_handle = str(raw.get("speaker_handle") or raw.get("user_handle") or speaker_id)
+        trust_level = classify(self.name, speaker_id)
 
-        if self.config.get("is_public_channel") and trust_level == "untrusted":
-            return None
+        is_public_channel = bool(self.config.get("is_public_channel", raw.get("is_public_channel", False)))
+        was_mentioned = bool(raw.get("was_mentioned", False))
+        if is_public_channel:
+            owners = [p.channel_user_id for p in get_pairing_store().owners(channel=self.name)]
+            ok, _why = allowed(
+                self.name,
+                speaker_id,
+                owner_ids=owners,
+                is_public_channel=True,
+                was_mentioned=was_mentioned,
+            )
+            if not ok:
+                return _drop()
 
-        result = await stt_router.transcribe(wav_bytes, "audio/wav")
+        if _is_silent(wav_bytes, threshold=_vad_threshold(self.config)):
+            return _drop()
 
-        if not result.text:
-            return None
+        mime = str(raw.get("mime") or "audio/wav")
+        stt_prefer = str(
+            self.config.get("stt_prefer")
+            or self.config.get("transcribe_prefer")
+            or self.config.get("prefer")
+            or "default"
+        )
+        transcript = await transcribe_audio(wav_bytes, mime, prefer=stt_prefer)
+        text = transcript.text.strip()
+        if not text:
+            return _drop()
 
-        art_ref = "art:" + hashlib.sha256(wav_bytes).hexdigest()[:16]
-
+        voice_audio_ref = _artifact_ref(wav_bytes, mock=mock)
         return ChannelMessage(
-            channel="local_mic",
+            channel=self.name,
             channel_user_id=speaker_id,
             user_handle=speaker_handle,
-            text=result.text,
-            voice_audio_ref=art_ref,
+            text=text,
+            voice_audio_ref=voice_audio_ref,
             trust_level=trust_level,
             arrived_at=datetime.now(UTC),
+            metadata={
+                "source": raw.get("source", "mic"),
+                "sample_rate": raw.get("sample_rate"),
+                "mime": mime,
+                "stt_provider": transcript.provider,
+                "stt_duration_ms": transcript.duration_ms,
+                "is_public_channel": is_public_channel,
+                "was_mentioned": was_mentioned,
+            },
         )
 
     async def send(self, reply: ChannelReply) -> Any:
         mock = self.config.get("mock")
+        text = reply.text or ""
 
-        if mock is not None and mock.rate_limited:
-            return {"status": 429, "error": "tts rate limit"}
+        if mock is not None and getattr(mock, "rate_limited", False):
+            return await mock.send({"channel_user_id": reply.channel_user_id, "text": text})
 
-        tts_result = await tts_router.synthesize(reply.text or "")
-        audio_bytes = base64.b64decode(tts_result.audio_b64)
-
+        voice_id = self.config.get("voice_id")
+        tts_prefer = str(self.config.get("tts_prefer") or self.config.get("speak_prefer") or "default")
+        speech = await synthesize_speech(text, voice_id=voice_id, prefer=tts_prefer)
+        audio_bytes = base64.b64decode(speech.audio_b64)
+        payload = {
+            "channel_user_id": reply.channel_user_id,
+            "text": text,
+            "audio_bytes": audio_bytes,
+            "mime": speech.mime,
+            "sample_rate": speech.sample_rate,
+            "provider": speech.provider,
+            "voice_id": voice_id,
+        }
         if mock is not None:
-            await mock.play(audio_bytes)
+            return await mock.send(payload)
+        return payload
 
-        return {"status": 200}
+
+def _as_bytes(value: Any) -> bytes:
+    if isinstance(value, bytes):
+        return value
+    if isinstance(value, bytearray):
+        return bytes(value)
+    if isinstance(value, memoryview):
+        return value.tobytes()
+    return b""
+
+
+def _drop() -> ChannelMessage:
+    return cast(ChannelMessage, None)
+
+
+def _vad_threshold(config: dict[str, Any]) -> float:
+    raw = config.get("vad_rms_threshold", DEFAULT_VAD_RMS_THRESHOLD)
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_VAD_RMS_THRESHOLD
+
+
+def _is_silent(audio: bytes, *, threshold: float) -> bool:
+    frames = _wav_pcm_frames(audio)
+    if frames is None:
+        return not any(audio)
+    if not frames:
+        return True
+    return _rms_16bit_pcm(frames) < threshold
+
+
+def _wav_pcm_frames(audio: bytes) -> bytes | None:
+    try:
+        with wave.open(io.BytesIO(audio), "rb") as wav:
+            if wav.getsampwidth() != 2:
+                return None
+            return wav.readframes(wav.getnframes())
+    except (EOFError, wave.Error):
+        return None
+
+
+def _rms_16bit_pcm(frames: bytes) -> float:
+    usable = len(frames) - (len(frames) % 2)
+    if usable <= 0:
+        return 0.0
+    total = 0
+    count = 0
+    for (sample,) in struct.iter_unpack("<h", frames[:usable]):
+        total += sample * sample
+        count += 1
+    if count == 0:
+        return 0.0
+    return math.sqrt(total / count)
+
+
+def _artifact_ref(audio: bytes, *, mock: Any) -> str:
+    sha = hashlib.sha256(audio).hexdigest()
+    store_artifact = getattr(mock, "store_artifact", None)
+    if callable(store_artifact):
+        return store_artifact(sha, audio)
+    return f"art:{sha}"
